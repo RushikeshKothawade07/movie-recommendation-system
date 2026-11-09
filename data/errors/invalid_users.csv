@@ -1,6 +1,0 @@
-user_id,age,gender,occupation,zip_code,validation_errors
-7,,M,administrator,91344,MISSING_AGE
-238,,F,administrator,44124,MISSING_AGE
-272,,M,scientist,53706,MISSING_AGE
-693,,F,healthcare,85210,MISSING_AGE
-889,,M,technician,78704,MISSING_AGE

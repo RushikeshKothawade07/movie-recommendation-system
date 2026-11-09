@@ -1,3 +1,9 @@
+# Node & JavaScript dependencies
+node_modules/
+frontend/node_modules/
+.npm
+package-lock.json.bak
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -10,6 +16,9 @@ env/
 .venv/
 ENV/
 dmml2/
+.env
+.env.local
+.env.*.local
 
 # MLflow SQLite & artifacts
 mlruns/
