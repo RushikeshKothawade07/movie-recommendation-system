@@ -17,8 +17,14 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("bollywise")
 
-# Base Directory Resolution
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Base Directory Resolution (with serverless environment compatibility)
+possible_roots = [
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.abspath(__file__)),
+    os.getcwd(),
+    "/var/task"
+]
+ROOT_DIR = next((p for p in possible_roots if os.path.exists(os.path.join(p, "models")) or os.path.exists(os.path.join(p, "data"))), possible_roots[0])
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
@@ -103,112 +109,142 @@ def load_data_and_models():
     global svd_model, pop_model, items_df, item_lookup, genre_list
     logger.info("Initializing BollyWise recommendation engine and loading datasets...")
     
-    # 1. Load Processed Items
-    items_path = os.path.join(ROOT_DIR, "data", "processed", "cleaned_items.parquet")
-    items_df = pd.read_parquet(items_path)
+    try:
+        # 1. Load Processed Items (Try fast json first, fallback to parquet)
+        items_json = os.path.join(ROOT_DIR, "data", "processed", "cleaned_items.json")
+        items_parquet = os.path.join(ROOT_DIR, "data", "processed", "cleaned_items.parquet")
+        
+        if os.path.exists(items_json):
+            with open(items_json, "r", encoding="utf-8") as f:
+                items_df = pd.DataFrame(json.load(f))
+        elif os.path.exists(items_parquet):
+            items_df = pd.read_parquet(items_parquet)
+        else:
+            logger.warning(f"No catalog file found at {items_json} or {items_parquet}. Using fallback catalog.")
+            items_df = pd.DataFrame([
+                {"item_id": 1, "title": "3 Idiots (2009)", "genres": "Comedy|Drama", "release_year": 2009, "ratings_count": 100, "avg_rating": 4.8},
+                {"item_id": 2, "title": "Dilwale Dulhania Le Jayenge (1995)", "genres": "Drama|Romance", "release_year": 1995, "ratings_count": 95, "avg_rating": 4.7},
+                {"item_id": 3, "title": "Sholay (1975)", "genres": "Action|Adventure", "release_year": 1975, "ratings_count": 90, "avg_rating": 4.9},
+                {"item_id": 4, "title": "Dangal (2016)", "genres": "Action|Biography|Drama", "release_year": 2016, "ratings_count": 88, "avg_rating": 4.8}
+            ])
 
-    # 2. Load Interaction Statistics
-    train_path = os.path.join(ROOT_DIR, "data", "processed", "train_interactions.parquet")
-    if os.path.exists(train_path):
-        train_df = pd.read_parquet(train_path)
-        stats = train_df.groupby("item_id").agg(
-            ratings_count=("rating", "count"),
-            avg_rating=("rating", "mean")
-        ).reset_index()
-        items_df = items_df.merge(stats, on="item_id", how="left")
-        items_df["ratings_count"] = items_df["ratings_count"].fillna(0).astype(int)
-        items_df["avg_rating"] = items_df["avg_rating"].fillna(0.0).round(2)
-    else:
-        items_df["ratings_count"] = 50
-        items_df["avg_rating"] = 4.0
+        # 2. Compute or fill Interaction Statistics
+        if "ratings_count" not in items_df.columns:
+            train_path = os.path.join(ROOT_DIR, "data", "processed", "train_interactions.parquet")
+            if os.path.exists(train_path):
+                try:
+                    train_df = pd.read_parquet(train_path)
+                    stats = train_df.groupby("item_id").agg(
+                        ratings_count=("rating", "count"),
+                        avg_rating=("rating", "mean")
+                    ).reset_index()
+                    items_df = items_df.merge(stats, on="item_id", how="left")
+                except Exception as ex:
+                    logger.warning(f"Could not compute train stats: {ex}")
+            items_df["ratings_count"] = items_df.get("ratings_count", pd.Series(50, index=items_df.index)).fillna(50).astype(int)
+            items_df["avg_rating"] = items_df.get("avg_rating", pd.Series(4.0, index=items_df.index)).fillna(4.0).round(2)
 
-    # 3. Merge Bollywood GitHub + IMDb India Metadata
-    bm_csv = os.path.join(ROOT_DIR, "data", "raw", "bollywood_full_github.csv")
-    imdb_csv = os.path.join(ROOT_DIR, "data", "raw", "imdb_movies_india.csv")
-    
-    bm_lookup = {}
-    if os.path.exists(bm_csv):
-        try:
-            df_bm = pd.read_csv(bm_csv)
-            for _, r in df_bm.iterrows():
-                t = str(r.get("movie_name", "")).lower().strip()
-                bm_lookup[t] = {
-                    "overview": str(r.get("overview", "")).strip(),
-                    "director": str(r.get("director", "")).strip(),
-                    "cast": str(r.get("cast", "")).strip()
-                }
-        except Exception as e:
-            logger.warning(f"Could not load bollywood_full_github.csv: {e}")
-
-    imdb_lookup = {}
-    if os.path.exists(imdb_csv):
-        try:
-            df_imdb = pd.read_csv(imdb_csv, encoding="latin1")
-            for _, r in df_imdb.iterrows():
-                t = str(r.get("Name", "")).lower().strip()
-                if t not in imdb_lookup:
-                    actors = f"{r.get('Actor 1', '')}, {r.get('Actor 2', '')}, {r.get('Actor 3', '')}".replace("nan", "").strip(", ")
-                    imdb_lookup[t] = {
-                        "rating": str(r.get("Rating", "")).strip(),
-                        "votes": str(r.get("Votes", "")).strip(),
-                        "duration": str(r.get("Duration", "")).strip(),
-                        "director": str(r.get("Director", "")).strip(),
-                        "actors": actors
+        # 3. Merge Bollywood GitHub + IMDb India Metadata
+        bm_csv = os.path.join(ROOT_DIR, "data", "raw", "bollywood_full_github.csv")
+        imdb_csv = os.path.join(ROOT_DIR, "data", "raw", "imdb_movies_india.csv")
+        
+        bm_lookup = {}
+        if os.path.exists(bm_csv):
+            try:
+                df_bm = pd.read_csv(bm_csv)
+                for _, r in df_bm.iterrows():
+                    t = str(r.get("movie_name", "")).lower().strip()
+                    bm_lookup[t] = {
+                        "overview": str(r.get("overview", "")).strip(),
+                        "director": str(r.get("director", "")).strip(),
+                        "cast": str(r.get("cast", "")).strip()
                     }
-        except Exception as e:
-            logger.warning(f"Could not load imdb_movies_india.csv: {e}")
+            except Exception as e:
+                logger.warning(f"Could not load bollywood_full_github.csv: {e}")
 
-    # 4. Construct Item Lookup Catalog
-    item_lookup = {}
-    for _, row in items_df.iterrows():
-        iid = int(row["item_id"])
-        meta = get_movie_meta(iid, str(row["title"]))
-        clean_t = str(row["title"]).split(" (")[0].split(":")[0].split(" - ")[0].strip().lower()
-        
-        bm_info = bm_lookup.get(clean_t, {})
-        imdb_info = imdb_lookup.get(clean_t, {})
-        
-        plot = bm_info.get("overview") or meta.get("plot") or f"A celebrated Bollywood masterpiece '{row['title']}' featuring iconic Hindi cinema storytelling."
-        director = bm_info.get("director") or imdb_info.get("director") or meta.get("director") or "Acclaimed Hindi Director"
-        actors = bm_info.get("cast") or imdb_info.get("actors") or meta.get("actors") or "Leading Bollywood Cast"
-        imdb_score = imdb_info.get("rating") if imdb_info.get("rating") and imdb_info.get("rating") != "nan" else (meta.get("imdb") or "8.1")
-        runtime = imdb_info.get("duration") if imdb_info.get("duration") and imdb_info.get("duration") != "nan" else (meta.get("runtime") or "2h 30m")
-        
-        item_lookup[iid] = {
-            "item_id": iid,
-            "title": str(row["title"]),
-            "release_year": int(row["release_year"]) if pd.notna(row["release_year"]) else "",
-            "genres": str(row["genres"]) if pd.notna(row["genres"]) else "",
-            "ratings_count": int(row["ratings_count"]),
-            "avg_rating": float(row["avg_rating"]),
-            "poster": meta.get("poster"),
-            "plot": plot,
-            "director": director,
-            "actors": actors,
-            "imdb": imdb_score,
-            "runtime": runtime
-        }
+        imdb_lookup = {}
+        if os.path.exists(imdb_csv):
+            try:
+                df_imdb = pd.read_csv(imdb_csv, encoding="latin1")
+                for _, r in df_imdb.iterrows():
+                    t = str(r.get("Name", "")).lower().strip()
+                    if t not in imdb_lookup:
+                        actors = f"{r.get('Actor 1', '')}, {r.get('Actor 2', '')}, {r.get('Actor 3', '')}".replace("nan", "").strip(", ")
+                        imdb_lookup[t] = {
+                            "rating": str(r.get("Rating", "")).strip(),
+                            "votes": str(r.get("Votes", "")).strip(),
+                            "duration": str(r.get("Duration", "")).strip(),
+                            "director": str(r.get("Director", "")).strip(),
+                            "actors": actors
+                        }
+            except Exception as e:
+                logger.warning(f"Could not load imdb_movies_india.csv: {e}")
 
-    # Extract Unique Genres
-    all_genres = set()
-    for g_str in items_df["genres"].dropna():
-        for g in str(g_str).split("|"):
-            if g.strip():
-                all_genres.add(g.strip())
-    genre_list = sorted(list(all_genres))
+        # 4. Construct Item Lookup Catalog
+        item_lookup = {}
+        for _, row in items_df.iterrows():
+            iid = int(row["item_id"])
+            meta = get_movie_meta(iid, str(row["title"]))
+            clean_t = str(row["title"]).split(" (")[0].split(":")[0].split(" - ")[0].strip().lower()
+            
+            bm_info = bm_lookup.get(clean_t, {})
+            imdb_info = imdb_lookup.get(clean_t, {})
+            
+            plot = bm_info.get("overview") or meta.get("plot") or f"A celebrated Bollywood masterpiece '{row['title']}' featuring iconic Hindi cinema storytelling."
+            director = bm_info.get("director") or imdb_info.get("director") or meta.get("director") or "Acclaimed Hindi Director"
+            actors = bm_info.get("cast") or imdb_info.get("actors") or meta.get("actors") or "Leading Bollywood Cast"
+            imdb_score = imdb_info.get("rating") if imdb_info.get("rating") and imdb_info.get("rating") != "nan" else (meta.get("imdb") or "8.1")
+            runtime = imdb_info.get("duration") if imdb_info.get("duration") and imdb_info.get("duration") != "nan" else (meta.get("runtime") or "2h 30m")
+            
+            item_lookup[iid] = {
+                "item_id": iid,
+                "title": str(row["title"]),
+                "release_year": int(row["release_year"]) if pd.notna(row.get("release_year")) and str(row.get("release_year")).isdigit() else "",
+                "genres": str(row["genres"]) if pd.notna(row.get("genres")) else "",
+                "ratings_count": int(row.get("ratings_count", 50)),
+                "avg_rating": float(row.get("avg_rating", 4.0)),
+                "poster": meta.get("poster"),
+                "plot": plot,
+                "director": director,
+                "actors": actors,
+                "imdb": imdb_score,
+                "runtime": runtime
+            }
 
-    # 5. Load Trained Recommender Models
-    svd_path = os.path.join(ROOT_DIR, "models", "svd_model.pkl")
-    with open(svd_path, "rb") as f:
-        svd_model = pickle.load(f)
-        
-    pop_path = os.path.join(ROOT_DIR, "models", "popularity_model.pkl")
-    with open(pop_path, "rb") as f:
-        pop_model = pickle.load(f)
-        
-    logger.info(f"Loaded {len(item_lookup)} movies into catalog and calibrated latent space ({svd_model.n_factors}-D).")
+        # Extract Unique Genres
+        all_genres = set()
+        for g_str in items_df["genres"].dropna():
+            for g in str(g_str).split("|"):
+                if g.strip():
+                    all_genres.add(g.strip())
+        genre_list = sorted(list(all_genres))
 
-load_data_and_models()
+        # 5. Load Trained Recommender Models (with fail-safe fallback)
+        svd_path = os.path.join(ROOT_DIR, "models", "svd_model.pkl")
+        pop_path = os.path.join(ROOT_DIR, "models", "popularity_model.pkl")
+        
+        if os.path.exists(svd_path):
+            with open(svd_path, "rb") as f:
+                svd_model = pickle.load(f)
+        else:
+            logger.warning(f"SVD model not found at {svd_path}. Initializing fallback.")
+            svd_model = None
+
+        if os.path.exists(pop_path):
+            with open(pop_path, "rb") as f:
+                pop_model = pickle.load(f)
+        else:
+            pop_model = None
+            
+        factors_str = getattr(svd_model, 'n_factors', 32) if svd_model else 'Degraded'
+        logger.info(f"Loaded {len(item_lookup)} movies into catalog and calibrated latent space ({factors_str}-D).")
+    except Exception as e:
+        logger.error(f"Error in load_data_and_models: {e}")
+
+try:
+    load_data_and_models()
+except Exception as e:
+    logger.critical(f"Critical startup error caught: {e}")
 
 # Environment Variables
 DEV_MODE_PASSWORD = os.getenv("DEV_MODE_PASSWORD", os.getenv("VITE_DEV_MODE_PASSWORD", "rushikesh"))
@@ -654,42 +690,67 @@ def recommend_for_custom_user(req: CustomProfileRequest):
 @app.get("/api/movie/{item_id}/similar")
 @app.get("/movie/{item_id}/similar")
 def get_similar_movies(item_id: int, top_k: int = 6):
-    """Finds cosine-similar Bollywood movies using 32-D latent item embeddings."""
-    if item_id not in svd_model.item_to_idx:
-        raise HTTPException(status_code=404, detail="Movie not found in latent index")
-        
-    idx = svd_model.item_to_idx[item_id]
-    target_q = svd_model.Q[idx]
-    
-    # Cosine similarity in latent item space
-    norms = np.linalg.norm(svd_model.Q, axis=1) * np.linalg.norm(target_q)
-    norms[norms == 0] = 1e-9
-    sims = (svd_model.Q @ target_q) / norms
-    
-    top_indices = np.argsort(sims)[::-1]
+    """Finds cosine-similar Bollywood movies using 32-D latent item embeddings with genre fallback."""
+    try:
+        if svd_model and hasattr(svd_model, "item_to_idx") and item_id in svd_model.item_to_idx:
+            idx = svd_model.item_to_idx[item_id]
+            target_q = svd_model.Q[idx]
+            
+            # Cosine similarity in latent item space
+            norms = np.linalg.norm(svd_model.Q, axis=1) * np.linalg.norm(target_q)
+            norms[norms == 0] = 1e-9
+            sims = (svd_model.Q @ target_q) / norms
+            
+            top_indices = np.argsort(sims)[::-1]
+            similar = []
+            for s_idx in top_indices:
+                s_iid = int(svd_model.idx_to_item[s_idx])
+                if s_iid == item_id:
+                    continue
+                s_item = item_lookup.get(s_iid)
+                if not s_item:
+                    continue
+                sim_pct = int(min(99, max(60, (sims[s_idx] + 1.0) / 2.0 * 100)))
+                similar.append({
+                    "item_id": s_iid,
+                    "title": s_item["title"],
+                    "release_year": s_item.get("release_year", ""),
+                    "genres": [g for g in s_item.get("genres", "").split("|") if g],
+                    "similarity_pct": sim_pct,
+                    "poster": s_item.get("poster"),
+                    "plot": s_item.get("plot"),
+                    "imdb": s_item.get("imdb"),
+                    "director": s_item.get("director")
+                })
+                if len(similar) >= top_k:
+                    break
+            return {"movie_id": item_id, "similar": similar}
+    except Exception as ex:
+        logger.warning(f"SVD similarity computation failed for {item_id}: {ex}")
+
+    # Graceful fallback: return top genre-aligned titles
+    target_item = item_lookup.get(item_id, {})
+    target_genres = set(target_item.get("genres", "").split("|"))
     similar = []
-    for s_idx in top_indices:
-        s_iid = int(svd_model.idx_to_item[s_idx])
+    for s_iid, s_item in item_lookup.items():
         if s_iid == item_id:
             continue
-        s_item = item_lookup.get(s_iid)
-        if not s_item:
-            continue
-        sim_pct = int(min(99, max(60, (sims[s_idx] + 1.0) / 2.0 * 100)))
-        similar.append({
-            "item_id": s_iid,
-            "title": s_item["title"],
-            "release_year": s_item.get("release_year", ""),
-            "genres": [g for g in s_item.get("genres", "").split("|") if g],
-            "similarity_pct": sim_pct,
-            "poster": s_item.get("poster"),
-            "plot": s_item.get("plot"),
-            "imdb": s_item.get("imdb"),
-            "director": s_item.get("director")
-        })
+        s_genres = set(s_item.get("genres", "").split("|"))
+        overlap = len(target_genres & s_genres)
+        if overlap > 0 or not similar:
+            similar.append({
+                "item_id": s_iid,
+                "title": s_item["title"],
+                "release_year": s_item.get("release_year", ""),
+                "genres": [g for g in s_item.get("genres", "").split("|") if g],
+                "similarity_pct": min(95, 75 + overlap * 5),
+                "poster": s_item.get("poster"),
+                "plot": s_item.get("plot"),
+                "imdb": s_item.get("imdb"),
+                "director": s_item.get("director")
+            })
         if len(similar) >= top_k:
             break
-            
     return {"movie_id": item_id, "similar": similar}
 
 @app.get("/api/catalog")

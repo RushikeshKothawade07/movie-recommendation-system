@@ -345,15 +345,19 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      const data = await res.json();
-      if (data.recommendations) {
-        setRecommendations(data.recommendations);
-        setRecsMetadata({
-          cache_status: data.cache_status || 'CACHE_MISS',
-          cold_start_mitigation: data.cold_start_mitigation || 'Personalized Ridge SVD Projection',
-          degraded_mode: data.degraded_mode || false,
-          dismissed_count: data.dismissed_count || (dismissedToUse || []).length
-        });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.recommendations) {
+          setRecommendations(data.recommendations);
+          setRecsMetadata({
+            cache_status: data.cache_status || 'CACHE_MISS',
+            cold_start_mitigation: data.cold_start_mitigation || 'Personalized Ridge SVD Projection',
+            degraded_mode: data.degraded_mode || false,
+            dismissed_count: data.dismissed_count || (dismissedToUse || []).length
+          });
+        }
+      } else {
+        console.warn(`Recommend endpoint returned status ${res.status}`);
       }
     } catch (e) {
       console.error('Failed to fetch recommendations:', e);
@@ -387,9 +391,13 @@ export default function App() {
     setModalLoading(true);
     try {
       const res = await fetch(`${API_BASE}/movie/${movie.item_id}/similar?top_k=4`);
-      const data = await res.json();
-      if (data.similar) {
-        setSimilarMovies(data.similar);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.similar) {
+          setSimilarMovies(data.similar);
+        }
+      } else {
+        console.warn(`Similar movies endpoint returned status ${res.status}`);
       }
     } catch (e) {
       console.error('Error fetching similar movies:', e);
@@ -411,10 +419,14 @@ export default function App() {
       if (catalogGenre) params.append('genre', catalogGenre);
 
       const res = await fetch(`${API_BASE}/catalog?${params.toString()}`);
-      const data = await res.json();
-      if (data.movies) {
-        setCatalogMovies(data.movies);
-        setCatalogTotal(data.total_matches || data.total_movies || 0);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.movies) {
+          setCatalogMovies(data.movies);
+          setCatalogTotal(data.total_matches || data.total_movies || 0);
+        }
+      } else {
+        console.warn(`Catalog endpoint returned status ${res.status}`);
       }
     } catch (e) {
       console.error('Catalog fetch error:', e);
